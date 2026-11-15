@@ -3,6 +3,8 @@
 // passes positions, chat and tribe commands between players instantly.
 // Phase 2: the room also stores the surface map changes (trees cut, rocks mined,
 // walls built) in its own SQLite table and sends them to everyone, so the world is shared.
+// Phase 3: the room also stores shared world objects as small documents:
+//   c:<key> chest contents, n:<key> trading counters, t:<key> tribe doors, d:<z>:<x>:<y>:<item> items on the ground
 import { DurableObject } from 'cloudflare:workers';
 
 const str = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -27,6 +29,29 @@ export class Realm extends DurableObject {
     super(ctx, env);
     // k = tile key (x * 500 + y), v = tile id that replaces the natural tile
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tiles (k INTEGER PRIMARY KEY, v INTEGER NOT NULL)');
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS docs (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+  }
+
+  allDocs() {
+    const t = {};
+    for (const r of this.ctx.storage.sql.exec('SELECT k, v FROM docs')) t[r.k] = r.v;
+    return t;
+  }
+
+  // keeps only sensible documents: known kinds, short keys, values up to 4000 characters or null (= removed)
+  cleanDocs(t) {
+    const out = {};
+    let n = 0;
+    if (!t || typeof t !== 'object') return out;
+    for (const k of Object.keys(t)) {
+      if (n >= 500) break;
+      if (k.length > 80 || !/^[cntd]:[-\w:~.]+$/.test(k)) continue;
+      const v = t[k];
+      if (v === null) { out[k] = null; n++; continue; }
+      if (typeof v !== 'string' || v.length > 4000) continue;
+      out[k] = v; n++;
+    }
+    return out;
   }
 
   allTiles() {
@@ -134,6 +159,7 @@ export class Realm extends DurableObject {
         if (b) list.push(this.botPlayer(b));
         this.send(ws, { type: 'welcome', players: list, t: Date.now() });
         this.send(ws, { type: 'tiles', full: true, t: this.allTiles() });
+        this.send(ws, { type: 'docs', full: true, t: this.allDocs() });
       }
       this.broadcast(ws, { type: 'state', p: me });
       return;
@@ -171,6 +197,19 @@ export class Realm extends DurableObject {
       return;
     }
 
+    if (d.type === 'docs') {
+      if (!ws.deserializeAttachment()) return;
+      const t = this.cleanDocs(d.t);
+      const ks = Object.keys(t);
+      if (!ks.length) return;
+      for (const k of ks) {
+        if (t[k] === null) this.ctx.storage.sql.exec('DELETE FROM docs WHERE k = ?', k);
+        else this.ctx.storage.sql.exec('INSERT INTO docs (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, t[k]);
+      }
+      this.broadcast(ws, { type: 'docs', t });
+      return;
+    }
+
     if (d.type === 'ping') this.send(ws, { type: 'pong', t: Date.now() });
   }
 
@@ -199,3 +238,5 @@ export default {
     });
   },
 };
+
+
