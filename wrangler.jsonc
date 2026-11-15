@@ -1,0 +1,13 @@
+{
+  "name": "realm500",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "REALM", "class_name": "Realm" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Realm"] }
+  ]
+}
