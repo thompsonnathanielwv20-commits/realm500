@@ -5,6 +5,8 @@
 // walls built) in its own SQLite table and sends them to everyone, so the world is shared.
 // Phase 3: the room also stores shared world objects as small documents:
 //   c:<key> chest contents, n:<key> trading counters, t:<key> tribe doors, d:<z>:<x>:<y>:<item> items on the ground
+// Phase 4: accounts. One special room ("__accounts") keeps player names, salted password hashes,
+// login tokens and each player's saved character, reached through /acct/register, /acct/login, /acct/save, /acct/load
 import { DurableObject } from 'cloudflare:workers';
 
 const str = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -24,12 +26,69 @@ const cleanMsg = (m) => ({
   a: str(m.a, 5), r: num(m.r), tn: str(m.tn, 20), rn: str(m.rn, 16),
 });
 
+// salted password hash (PBKDF2), so the server never stores a readable password
+async function hashPass(pass, salt) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc.encode(salt), iterations: 10000, hash: 'SHA-256' }, key, 256);
+  return [...new Uint8Array(bits)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
 export class Realm extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     // k = tile key (x * 500 + y), v = tile id that replaces the natural tile
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tiles (k INTEGER PRIMARY KEY, v INTEGER NOT NULL)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS docs (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+  }
+
+  // ---------- accounts (only used by the "__accounts" room) ----------
+  async acct(request, action) {
+    const sql = this.ctx.storage.sql;
+    sql.exec('CREATE TABLE IF NOT EXISTS accounts (name TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, token TEXT NOT NULL, created INTEGER NOT NULL)');
+    sql.exec('CREATE TABLE IF NOT EXISTS saves (name TEXT PRIMARY KEY, data TEXT NOT NULL, t INTEGER NOT NULL)');
+    const reply = (o, status) => new Response(JSON.stringify(o), { status: status || 200, headers: { 'content-type': 'application/json' } });
+    if (request.method !== 'POST') return reply({ ok: false, err: 'Use POST' }, 405);
+    const raw = await request.text();
+    if (raw.length > 3000000) return reply({ ok: false, err: 'Save is too large' }, 413);
+    let b;
+    try { b = JSON.parse(raw); } catch (e) { return reply({ ok: false, err: 'Bad request' }, 400); }
+    const name = String(b.name || '').trim().toLowerCase();
+    if (!/^[a-z0-9_]{3,16}$/.test(name)) return reply({ ok: false, err: 'Names are 3-16 letters, numbers or _' });
+    const row = sql.exec('SELECT name, salt, hash, token FROM accounts WHERE name = ?', name).toArray()[0];
+    const saveRow = () => sql.exec('SELECT t, length(data) AS n FROM saves WHERE name = ?', name).toArray()[0];
+    const newToken = () => [...crypto.getRandomValues(new Uint8Array(24))].map((x) => x.toString(16).padStart(2, '0')).join('');
+
+    if (action === 'register' || action === 'login') {
+      const pass = String(b.pass || '');
+      if (pass.length < 6 || pass.length > 64) return reply({ ok: false, err: 'Passwords are 6-64 characters' });
+      if (action === 'register') {
+        if (row) return reply({ ok: false, err: 'That name is already taken' });
+        const salt = newToken().slice(0, 32), hash = await hashPass(pass, salt), token = newToken();
+        sql.exec('INSERT INTO accounts (name, salt, hash, token, created) VALUES (?, ?, ?, ?, ?)', name, salt, hash, token, Date.now());
+        return reply({ ok: true, name, token, hasSave: false, savedAt: 0 });
+      }
+      if (!row || (await hashPass(pass, row.salt)) !== row.hash) return reply({ ok: false, err: 'Wrong name or password' });
+      const token = newToken();
+      sql.exec('UPDATE accounts SET token = ? WHERE name = ?', token, name);
+      const sv = saveRow();
+      return reply({ ok: true, name, token, hasSave: !!sv, savedAt: sv ? sv.t : 0 });
+    }
+
+    // save and load need the token from the last login
+    if (!row || !b.token || String(b.token) !== row.token) return reply({ ok: false, err: 'Please log in again', relog: true });
+    if (action === 'save') {
+      const data = String(b.data || '');
+      if (!data || data.length > 2500000) return reply({ ok: false, err: 'Save is empty or too large' });
+      const t = Date.now();
+      sql.exec('INSERT INTO saves (name, data, t) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET data = excluded.data, t = excluded.t', name, data, t);
+      return reply({ ok: true, t });
+    }
+    if (action === 'load') {
+      const r = sql.exec('SELECT data, t FROM saves WHERE name = ?', name).toArray()[0];
+      return reply(r ? { ok: true, data: r.data, t: r.t } : { ok: false, err: 'No saved character yet' });
+    }
+    return reply({ ok: false, err: 'Unknown action' }, 404);
   }
 
   allDocs() {
@@ -77,6 +136,8 @@ export class Realm extends DurableObject {
   }
 
   async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith('/acct/')) return this.acct(request, path.slice(6));
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected a WebSocket', { status: 426 });
     }
@@ -228,6 +289,9 @@ export class Realm extends DurableObject {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith('/acct/')) {
+      return env.REALM.get(env.REALM.idFromName('__accounts')).fetch(request);
+    }
     if (url.pathname === '/ws') {
       const room = str(url.searchParams.get('room') || 'world', 20).toLowerCase();
       const stub = env.REALM.get(env.REALM.idFromName(room));
@@ -238,5 +302,3 @@ export default {
     });
   },
 };
-
-
