@@ -7,6 +7,12 @@
 //   c:<key> chest contents, n:<key> trading counters, t:<key> tribe doors, d:<z>:<x>:<y>:<item> items on the ground
 // Phase 4: accounts. One special room ("__accounts") keeps player names, salted password hashes,
 // login tokens and each player's saved character, reached through /acct/register, /acct/login, /acct/save, /acct/load
+// Phase 5a: shared bosses. The room keeps each boss's health ("pharaoh:17", "skking:9", "snake:6", ...).
+// Phones report the damage they deal, the room subtracts it and tells everyone, and when health hits 0
+// everyone in the fight gets the kill and the boss stays down for 30 minutes.
+// Phase 5b: shared regular monsters. Where players are close together, the one with the lowest id runs the
+// monsters ("host") and shares them; the others show the same monsters, send their hits to the host,
+// and the host sends back the hits its monsters land on them. The room just passes these messages on.
 import { DurableObject } from 'cloudflare:workers';
 
 const str = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -89,6 +95,29 @@ export class Realm extends DurableObject {
       return reply(r ? { ok: true, data: r.data, t: r.t } : { ok: false, err: 'No saved character yet' });
     }
     return reply({ ok: false, err: 'Unknown action' }, 404);
+  }
+
+  // ---------- shared bosses ----------
+  async bossLoad() {
+    if (!this.bosses) this.bosses = (await this.ctx.storage.get('bosses')) || {};
+    return this.bosses;
+  }
+
+  async bossDamage(ws, key, dmg, max) {
+    if (!/^[a-z]{3,12}:-?\d{1,3}$/.test(key)) return;
+    const B = await this.bossLoad(), now = Date.now(), me = ws.deserializeAttachment() || {};
+    let b = B[key];
+    if (b && b.until && now < b.until) return;
+    max = Math.max(1, Math.min(10000000, Math.round(Number(max) || 1)));
+    if (!b || (b.until && now >= b.until)) b = B[key] = { hp: max, max };
+    b.hp -= Math.max(0, Math.min(1000000, Math.round(Number(dmg) || 0)));
+    if (b.hp <= 0) {
+      b.hp = 0; b.until = now + 1800000; b.by = String(me.name || 'someone').slice(0, 16);
+      await this.ctx.storage.put('bosses', B);
+      this.broadcast(null, { type: 'boss', key, hp: 0, max: b.max, until: b.until, by: b.by });
+    } else {
+      this.broadcast(null, { type: 'boss', key, hp: b.hp, max: b.max });
+    }
   }
 
   allDocs() {
@@ -221,6 +250,7 @@ export class Realm extends DurableObject {
         this.send(ws, { type: 'welcome', players: list, t: Date.now() });
         this.send(ws, { type: 'tiles', full: true, t: this.allTiles() });
         this.send(ws, { type: 'docs', full: true, t: this.allDocs() });
+        this.send(ws, { type: 'bosses', t: await this.bossLoad(), now: Date.now() });
       }
       this.broadcast(ws, { type: 'state', p: me });
       return;
@@ -268,6 +298,29 @@ export class Realm extends DurableObject {
         else this.ctx.storage.sql.exec('INSERT INTO docs (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, t[k]);
       }
       this.broadcast(ws, { type: 'docs', t });
+      return;
+    }
+
+    if (d.type === 'bdmg') {
+      if (!ws.deserializeAttachment()) return;
+      await this.bossDamage(ws, String(d.key || ''), d.dmg, d.max);
+      return;
+    }
+
+    // the player whose phone runs a boss shares where it is, so everyone sees it in the same spot
+    if (d.type === 'bpos') {
+      if (!ws.deserializeAttachment() || !/^[a-z]{3,12}:-?\d{1,3}$/.test(String(d.key || ''))) return;
+      this.broadcast(ws, { type: 'bpos', key: String(d.key), x: Number(d.x) || 0, y: Number(d.y) || 0 });
+      return;
+    }
+
+    // mons = the host's monster list, mhit = a player's hit on a host monster, mhurt = a host monster's hit on a player
+    if (d.type === 'mons' || d.type === 'mhit' || d.type === 'mhurt') {
+      const me = ws.deserializeAttachment();
+      if (!me) return;
+      if (d.type === 'mons' && !Array.isArray(d.list)) return;
+      if (d.type === 'mons' && d.list.length > 80) d.list = d.list.slice(0, 80);
+      this.broadcast(ws, Object.assign({}, d, { from: me.id }));
       return;
     }
 
