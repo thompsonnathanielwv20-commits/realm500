@@ -85,3 +85,28 @@ export class Realm extends DurableObject {
 
   async webSocketClose(ws, code) {
     const a = ws.deserializ
+  async webSocketClose(ws, code) {
+    const a = ws.deserializeAttachment();
+    if (a && a.id) this.broadcast(ws, { type: 'leave', id: a.id });
+    try { ws.close(code || 1000, 'bye'); } catch (e) { /* already closed */ }
+  }
+
+  async webSocketError(ws) {
+    const a = ws.deserializeAttachment();
+    if (a && a.id) this.broadcast(ws, { type: 'leave', id: a.id });
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === '/ws') {
+      const room = str(url.searchParams.get('room') || 'world', 20).toLowerCase();
+      const stub = env.REALM.get(env.REALM.idFromName(room));
+      return stub.fetch(request);
+    }
+    return new Response('Realm500 server is running. Connect the game to /ws?room=world', {
+      headers: { 'content-type': 'text/plain' },
+    });
+  },
+};
