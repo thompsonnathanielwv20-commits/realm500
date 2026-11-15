@@ -84,8 +84,6 @@ export class Realm extends DurableObject {
   }
 
   async webSocketClose(ws, code) {
-    const a = ws.deserializ
-  async webSocketClose(ws, code) {
     const a = ws.deserializeAttachment();
     if (a && a.id) this.broadcast(ws, { type: 'leave', id: a.id });
     try { ws.close(code || 1000, 'bye'); } catch (e) { /* already closed */ }
