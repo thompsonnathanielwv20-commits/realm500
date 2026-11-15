@@ -1,7 +1,8 @@
-// Realm500 game server - phase 1: live connections.
-// One Durable Object ("Realm") per room keeps every player's live WebSocket,
-// passes positions, chat and tribe commands between players instantly,
-// and tells everyone when someone joins or leaves.
+// Realm500 game server
+// Phase 1: one Durable Object ("Realm") per room keeps every player's live WebSocket,
+// passes positions, chat and tribe commands between players instantly.
+// Phase 2: the room also stores the surface map changes (trees cut, rocks mined,
+// walls built) in its own SQLite table and sends them to everyone, so the world is shared.
 import { DurableObject } from 'cloudflare:workers';
 
 const str = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -22,6 +23,34 @@ const cleanMsg = (m) => ({
 });
 
 export class Realm extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    // k = tile key (x * 500 + y), v = tile id that replaces the natural tile
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS tiles (k INTEGER PRIMARY KEY, v INTEGER NOT NULL)');
+  }
+
+  allTiles() {
+    const t = {};
+    for (const r of this.ctx.storage.sql.exec('SELECT k, v FROM tiles')) t[r.k] = r.v;
+    return t;
+  }
+
+  // keeps only sensible tile changes: integer keys, tile ids 0-255 or null (= back to natural)
+  cleanTiles(t) {
+    const out = {};
+    let n = 0;
+    if (!t || typeof t !== 'object') return out;
+    for (const ks of Object.keys(t)) {
+      if (n >= 3000) break;
+      const k = Number(ks), v = t[ks];
+      if (!Number.isInteger(k) || k < -2000000 || k > 2000000) continue;
+      if (v === null) { out[k] = null; n++; continue; }
+      if (!Number.isInteger(v) || v < 0 || v > 255) continue;
+      out[k] = v; n++;
+    }
+    return out;
+  }
+
   async fetch(request) {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected a WebSocket', { status: 426 });
@@ -89,7 +118,7 @@ export class Realm extends DurableObject {
   }
 
   async webSocketMessage(ws, raw) {
-    if (typeof raw !== 'string' || raw.length > 4000) return;
+    if (typeof raw !== 'string' || raw.length > 400000) return;
     let d;
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (!d || typeof d !== 'object') return;
@@ -104,6 +133,7 @@ export class Realm extends DurableObject {
         const b = await this.ctx.storage.get('bot');
         if (b) list.push(this.botPlayer(b));
         this.send(ws, { type: 'welcome', players: list, t: Date.now() });
+        this.send(ws, { type: 'tiles', full: true, t: this.allTiles() });
       }
       this.broadcast(ws, { type: 'state', p: me });
       return;
@@ -125,6 +155,19 @@ export class Realm extends DurableObject {
         await this.ctx.storage.put('bot', b);
         this.broadcast(null, { type: 'chat', from: 'echobot', n: 'Echo Bot', z: bp.z, x: bp.x, y: bp.y, ptr: '', prk: 0, m: { k: 'echo-' + Date.now().toString(36), t: 'Echo: ' + m.t, at: Date.now(), c: m.c === 'l' ? 'l' : 'g', tr: '', to: '', a: '', r: 0, tn: '', rn: '' } });
       }
+      return;
+    }
+
+    if (d.type === 'tiles') {
+      if (!ws.deserializeAttachment()) return;
+      const t = this.cleanTiles(d.t);
+      const ks = Object.keys(t);
+      if (!ks.length) return;
+      for (const k of ks) {
+        if (t[k] === null) this.ctx.storage.sql.exec('DELETE FROM tiles WHERE k = ?', Number(k));
+        else this.ctx.storage.sql.exec('INSERT INTO tiles (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', Number(k), t[k]);
+      }
+      this.broadcast(ws, { type: 'tiles', t });
       return;
     }
 
