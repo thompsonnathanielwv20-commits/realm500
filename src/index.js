@@ -13,6 +13,12 @@
 // Phase 5b: shared regular monsters. Where players are close together, the one with the lowest id runs the
 // monsters ("host") and shares them; the others show the same monsters, send their hits to the host,
 // and the host sends back the hits its monsters land on them. The room just passes these messages on.
+// Phase 6a: safety. Logged-in players prove who they are (their name is locked to their account and marked
+// verified), every connection is rate limited so one phone can't flood the room, suspicious things are logged
+// (see them under the Worker's Observability / Logs), and cave (underground) map changes are shared too.
+// Phase 6b: tribes run on the server. Tribes, members, ranks and custom ranks live in the accounts room,
+// tied to verified accounts, so nobody can fake a rank. Rooms ask the accounts room through an internal
+// /tribe/ path that the public internet can't reach (the Worker only forwards /acct/ and /ws).
 import { DurableObject } from 'cloudflare:workers';
 
 const str = (v, n) => String(v == null ? '' : v).slice(0, n);
@@ -83,6 +89,7 @@ export class Realm extends DurableObject {
 
     // save and load need the token from the last login
     if (!row || !b.token || String(b.token) !== row.token) return reply({ ok: false, err: 'Please log in again', relog: true });
+    if (action === 'check') return reply({ ok: true, name });
     if (action === 'save') {
       const data = String(b.data || '');
       if (!data || data.length > 2500000) return reply({ ok: false, err: 'Save is empty or too large' });
@@ -118,6 +125,13 @@ export class Realm extends DurableObject {
     } else {
       this.broadcast(null, { type: 'boss', key, hp: b.hp, max: b.max });
     }
+  }
+
+  async tribeCall(acct, cmd, arg) {
+    try {
+      const r = await this.env.REALM.get(this.env.REALM.idFromName('__accounts')).fetch(new Request('https://realm/tribe', { method: 'POST', body: JSON.stringify({ acct, cmd, arg }) }));
+      return await r.json();
+    } catch (e) { console.log('tribe call failed', String(e)); return null; }
   }
 
   allDocs() {
@@ -156,7 +170,8 @@ export class Realm extends DurableObject {
     for (const ks of Object.keys(t)) {
       if (n >= 3000) break;
       const k = Number(ks), v = t[ks];
-      if (!Number.isInteger(k) || k < -2000000 || k > 2000000) continue;
+      // surface keys are x * 500 + y; cave (z = -1) keys are the same minus 10,000,000
+      if (!Number.isInteger(k) || k < -12000000 || k > 2000000) continue;
       if (v === null) { out[k] = null; n++; continue; }
       if (!Number.isInteger(v) || v < 0 || v > 255) continue;
       out[k] = v; n++;
@@ -164,9 +179,96 @@ export class Realm extends DurableObject {
     return out;
   }
 
+  // ---------- tribes (only used by the "__accounts" room, reached from other rooms, never from outside) ----------
+  async tribe(request) {
+    const sql = this.ctx.storage.sql;
+    sql.exec('CREATE TABLE IF NOT EXISTS tribes (id TEXT PRIMARY KEY, name TEXT NOT NULL, ranks TEXT NOT NULL, created INTEGER NOT NULL)');
+    sql.exec('CREATE TABLE IF NOT EXISTS members (acct TEXT PRIMARY KEY, tribe TEXT NOT NULL, rk REAL NOT NULL, rn TEXT NOT NULL)');
+    const reply = (o) => new Response(JSON.stringify(o), { headers: { 'content-type': 'application/json' } });
+    const b = await request.json();
+    const me = str(b.acct, 16).toLowerCase(), cmd = String(b.cmd || ''), arg = str(b.arg, 80).trim();
+    const BASE = [{ n: 'Recruit', l: 1 }, { n: 'Son', l: 2 }, { n: 'Elder', l: 3 }, { n: 'Leader', l: 4 }];
+    const memberOf = (a) => sql.exec('SELECT acct, tribe, rk, rn FROM members WHERE acct = ?', a).toArray()[0];
+    const tribeOf = (id) => sql.exec('SELECT id, name, ranks FROM tribes WHERE id = ?', id).toArray()[0];
+    const ranksOf = (T) => BASE.concat(JSON.parse(T.ranks || '[]')).sort((x, y) => x.l - y.l);
+    const rankName = (T, l) => { let n = 'Recruit'; for (const q of ranksOf(T)) if (q.l <= l) n = q.n; return n; };
+    const infoFor = (a) => {
+      const m = memberOf(a);
+      if (!m) return null;
+      const T = tribeOf(m.tribe);
+      if (!T) return null;
+      return { id: T.id, n: T.name, rk: m.rk, rn: m.rn || rankName(T, m.rk), ranks: JSON.parse(T.ranks || '[]') };
+    };
+    const out = (msg, affected) => reply({ ok: true, msg, affected: (affected || []).map((a) => ({ acct: a, info: infoFor(a) })) });
+    const M = memberOf(me);
+    const T = M ? tribeOf(M.tribe) : null;
+    const parts = arg.split(/\s+/).filter((q) => q);
+
+    if (cmd === 'info') return out('', [me]);
+    if (cmd === '/tribe' && !arg) {
+      if (!T) return out('You are not in a tribe. Craft a Tribal relic (5 gold) and type /tribe followed by a name to found one', [me]);
+      const list = sql.exec('SELECT acct, rk, rn FROM members WHERE tribe = ? ORDER BY rk DESC LIMIT 30', T.id).toArray();
+      return out(T.name + ' - you are ' + (M.rn || rankName(T, M.rk)) + ' - members: ' + list.map((q) => q.acct + ' (' + (q.rn || rankName(T, q.rk)) + ')').join(', '), [me]);
+    }
+    if (cmd === '/tribe') {
+      if (T) return out('You are already in ' + T.name + ' - type /leave first', []);
+      const nm = arg.slice(0, 20);
+      if (sql.exec('SELECT id FROM tribes WHERE lower(name) = ?', nm.toLowerCase()).toArray().length) return out('A tribe called ' + nm + ' already exists', []);
+      const id = 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      sql.exec('INSERT INTO tribes (id, name, ranks, created) VALUES (?, ?, ?, ?)', id, nm, '[]', Date.now());
+      sql.exec('INSERT INTO members (acct, tribe, rk, rn) VALUES (?, ?, ?, ?) ON CONFLICT(acct) DO UPDATE SET tribe = excluded.tribe, rk = excluded.rk, rn = excluded.rn', me, id, 4, 'Leader');
+      return out('You founded the tribe ' + nm + ' and are its Leader! /invite players to join', [me]);
+    }
+    if (!T) return out('You are not in a tribe', []);
+    if (cmd === '/leave') { sql.exec('DELETE FROM members WHERE acct = ?', me); return out('You left ' + T.name, [me]); }
+    if (cmd === '/ranks') return out('Ranks of ' + T.name + ' (low to high): ' + ranksOf(T).map((q) => q.n).join(' < '), []);
+    if (cmd === '/create' || cmd === '/createrank') {
+      if (M.rk < 4) return out('Only Leaders can create ranks', []);
+      const mm = arg.replace(/^rank\s*/i, '').match(/^(.+?)\s+(above|below)\s+(.+)$/i);
+      const L = ranksOf(T);
+      if (!mm) return out('Type /create rank Name above Son (or below Elder). Ranks: ' + L.map((q) => q.n).join(' < '), []);
+      const ref = L.find((q) => q.n.toLowerCase() === mm[3].trim().toLowerCase());
+      if (!ref) return out('There is no rank called ' + mm[3].trim(), []);
+      const nm = mm[1].trim().slice(0, 16), up = mm[2].toLowerCase() === 'above', i = L.indexOf(ref);
+      if (L.some((q) => q.n.toLowerCase() === nm.toLowerCase())) return out('That rank already exists', []);
+      if (up && ref.l >= 4) return out('Leader is the highest rank', []);
+      const lv = up ? (ref.l + L[i + 1].l) / 2 : (ref.l + (i > 0 ? L[i - 1].l : 0)) / 2;
+      const custom = JSON.parse(T.ranks || '[]').concat([{ n: nm, l: lv }]);
+      sql.exec('UPDATE tribes SET ranks = ? WHERE id = ?', JSON.stringify(custom), T.id);
+      const all = sql.exec('SELECT acct FROM members WHERE tribe = ?', T.id).toArray().map((q) => q.acct);
+      return out('New rank ' + nm + ' created. Ranks: ' + ranksOf(tribeOf(T.id)).map((q) => q.n).join(' < '), all);
+    }
+    const target = (parts[0] || '').toLowerCase();
+    if (!target) return out('Type ' + cmd + ' followed by a player name', []);
+    const TM = memberOf(target);
+    if (cmd === '/invite') {
+      if (M.rk < 3) return out('Only Elders and Leaders can invite', []);
+      if (!sql.exec('SELECT name FROM accounts WHERE name = ?', target).toArray().length) return out('There is no account called ' + target, []);
+      if (TM) return out(target + ' is already in a tribe', []);
+      sql.exec('INSERT INTO members (acct, tribe, rk, rn) VALUES (?, ?, ?, ?)', target, T.id, 1, '');
+      return out(target + ' joined ' + T.name + ' as a Recruit', [me, target]);
+    }
+    if (!TM || TM.tribe !== T.id) return out(target + ' is not in your tribe', []);
+    if (cmd === '/promote') {
+      if (M.rk < 4) return out('Only Leaders can promote', []);
+      const rq = parts.slice(1).join(' ').toLowerCase(), R = ranksOf(T).find((q) => q.n.toLowerCase() === rq);
+      if (!R) return out('Type /promote name followed by a rank: ' + ranksOf(T).map((q) => q.n).join(', '), []);
+      sql.exec('UPDATE members SET rk = ?, rn = ? WHERE acct = ?', R.l, R.n, target);
+      return out(target + ' is now ' + R.n, [me, target]);
+    }
+    if (cmd === '/kick' || cmd === '/kik') {
+      if (M.rk < 2) return out('Recruits cannot kick anyone', []);
+      if (TM.rk >= M.rk) return out('You can only kick lower-ranked members', []);
+      sql.exec('DELETE FROM members WHERE acct = ?', target);
+      return out('Removed ' + target + ' from ' + T.name, [me, target]);
+    }
+    return out('Unknown tribe command', []);
+  }
+
   async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path.startsWith('/acct/')) return this.acct(request, path.slice(6));
+    if (path === '/tribe') return this.tribe(request);
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected a WebSocket', { status: 426 });
     }
@@ -238,10 +340,47 @@ export class Realm extends DurableObject {
     try { d = JSON.parse(raw); } catch (e) { return; }
     if (!d || typeof d !== 'object') return;
 
+    // rate limits: at most 40 messages and 3 chat lines per second from one phone
+    const now = Date.now();
+    if (!this.rl) this.rl = new Map();
+    let rl = this.rl.get(ws);
+    if (!rl || now - rl.t >= 1000) { rl = { t: now, n: 0, c: 0, warned: rl ? rl.warned : false }; this.rl.set(ws, rl); }
+    rl.n++;
+    if (d.type === 'chat') rl.c++;
+    if (rl.n > 40 || rl.c > 3) {
+      if (!rl.warned) { rl.warned = true; const a = ws.deserializeAttachment() || {}; console.log('rate limit hit', a.id, a.name, d.type); }
+      return;
+    }
+
+    // log in on the live connection: the accounts room confirms the token, then the name is locked
+    if (d.type === 'auth') {
+      const a = ws.deserializeAttachment();
+      if (!a) return;
+      let ok = false, name = '';
+      try {
+        const r = await this.env.REALM.get(this.env.REALM.idFromName('__accounts')).fetch(new Request('https://realm/acct/check', { method: 'POST', body: JSON.stringify({ name: d.name, token: d.token }) }));
+        const j = await r.json();
+        ok = !!j.ok; name = j.name || '';
+      } catch (e) { ok = false; }
+      if (!ok) { console.log('failed live login', a.id, str(d.name, 16)); this.send(ws, { type: 'authfail' }); return; }
+      a.acct = name; a.name = name; a.v = 1;
+      const tr = await this.tribeCall(name, 'info', '');
+      const info = tr && tr.affected && tr.affected[0] ? tr.affected[0].info : null;
+      a.tr = info ? info.id : ''; a.rk = info ? info.rk : 0; a.rn = info ? info.rn : '';
+      ws.serializeAttachment(a);
+      this.send(ws, { type: 'authok', name });
+      this.send(ws, { type: 'tribe', info, msg: '' });
+      this.broadcast(ws, { type: 'state', p: a });
+      return;
+    }
+
     if (d.type === 'hello' || d.type === 'state') {
       const me = cleanPlayer(d.me || {});
       if (!me.id) return;
-      const first = !ws.deserializeAttachment();
+      const prev = ws.deserializeAttachment();
+      if (prev && prev.acct) { me.acct = prev.acct; me.name = prev.acct; me.v = 1; me.tr = prev.tr || ''; me.rk = prev.rk || 0; me.rn = prev.rn || ''; }
+      if (prev && prev.id && prev.id !== me.id) { console.log('player id changed mid-connection', prev.id, me.id); return; }
+      const first = !prev;
       ws.serializeAttachment(me);
       if (first) {
         const list = this.players(ws);
@@ -264,7 +403,7 @@ export class Realm extends DurableObject {
       const cmd = m.t.trim().toLowerCase();
       if (cmd === '!bot') { await this.botStart(me); return; }
       if (cmd === '!bot off') { await this.botStop(); return; }
-      this.broadcast(ws, { type: 'chat', from: me.id, n: me.name, z: me.z, x: me.x, y: me.y, ptr: me.tr, prk: me.rk, m });
+      this.broadcast(ws, { type: 'chat', from: me.id, n: me.name, v: me.v || 0, z: me.z, x: me.x, y: me.y, ptr: me.tr, prk: me.rk, m });
       const b = await this.ctx.storage.get('bot');
       if (b && m.c !== 'x' && m.c !== 't' && m.t) {
         const bp = this.botPlayer(b);
@@ -301,6 +440,30 @@ export class Realm extends DurableObject {
       return;
     }
 
+    // tribe commands from verified players go to the accounts room; everyone affected in this room hears back
+    if (d.type === 'tribe') {
+      const a = ws.deserializeAttachment();
+      if (!a) return;
+      if (!a.acct) { this.send(ws, { type: 'tribe', keep: true, msg: 'Log in (in the 🌐 menu) to use tribes' }); return; }
+      const r = await this.tribeCall(a.acct, str(d.cmd, 12), str(d.arg, 80));
+      if (!r) { this.send(ws, { type: 'tribe', keep: true, msg: 'The tribe server did not answer - try again' }); return; }
+      const told = new Set();
+      for (const af of r.affected || []) {
+        for (const w of this.ctx.getWebSockets()) {
+          const x = w.deserializeAttachment();
+          if (!x || x.acct !== af.acct) continue;
+          const info = af.info;
+          x.tr = info ? info.id : ''; x.rk = info ? info.rk : 0; x.rn = info ? info.rn : '';
+          w.serializeAttachment(x);
+          this.send(w, { type: 'tribe', info, msg: w === ws ? r.msg : '' });
+          if (w === ws) told.add(w);
+          this.broadcast(w, { type: 'state', p: x });
+        }
+      }
+      if (!told.has(ws)) this.send(ws, { type: 'tribe', keep: true, msg: r.msg });
+      return;
+    }
+
     if (d.type === 'bdmg') {
       if (!ws.deserializeAttachment()) return;
       await this.bossDamage(ws, String(d.key || ''), d.dmg, d.max);
@@ -328,6 +491,7 @@ export class Realm extends DurableObject {
   }
 
   async webSocketClose(ws, code) {
+    if (this.rl) this.rl.delete(ws);
     const a = ws.deserializeAttachment();
     if (a && a.id) this.broadcast(ws, { type: 'leave', id: a.id });
     try { ws.close(code || 1000, 'bye'); } catch (e) { /* already closed */ }
